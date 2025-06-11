@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from scipy.interpolate import RBFInterpolator as ScipyRBFInterpolator
 
-from interpax._rbf_jax import RBFInterpolator
+from interpax._rbf import RBFInterpolator
 
 # Test data
 def _get_test_data_1d():
@@ -239,4 +239,202 @@ def test_memory_chunking():
     
     # Check that the result is reasonable
     assert np.all(np.isfinite(y_test))
-    assert np.all(np.abs(y_test) <= 1.1)  # sin is bounded by 1 
+    assert np.all(np.abs(y_test) <= 1.1)  # sin is bounded by 1
+
+def test_neighbors_basic():
+    """Test basic neighbors functionality."""
+    points, values = _get_test_data_2d()
+    
+    # Create interpolators with and without neighbors
+    rbf_global = RBFInterpolator(points, values, kernel="thin_plate_spline")
+    rbf_local = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=10)
+    
+    # Test points
+    x_test = np.linspace(0, 1, 10)
+    y_test = np.linspace(0, 1, 10)
+    X_test, Y_test = np.meshgrid(x_test, y_test)
+    points_test = np.column_stack((X_test.ravel(), Y_test.ravel()))
+    
+    # Evaluate both
+    values_global = rbf_global(points_test)
+    values_local = rbf_local(points_test)
+    
+    # Results should be finite and of correct shape
+    assert values_global.shape == values_local.shape
+    assert np.all(np.isfinite(values_global))
+    assert np.all(np.isfinite(values_local))
+    
+    # Results should be similar but not necessarily identical
+    # (local interpolation will be different from global)
+    correlation = np.corrcoef(values_global, values_local)[0, 1]
+    assert correlation > 0.7  # Should be reasonably correlated
+
+@pytest.mark.parametrize("neighbors", [1, 5, 10, 15])
+def test_neighbors_count(neighbors):
+    """Test different neighbor counts."""
+    points, values = _get_test_data_2d()
+    
+    # Create interpolator with neighbors
+    rbf = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=neighbors)
+    
+    # Test points
+    points_test = np.array([[0.5, 0.5], [0.2, 0.8]])
+    
+    # Evaluate
+    values_test = rbf(points_test)
+    
+    # Results should be finite and of correct shape
+    assert values_test.shape == (2,)
+    assert np.all(np.isfinite(values_test))
+
+@pytest.mark.parametrize("kernel", [
+    "linear",
+    "thin_plate_spline", 
+    "cubic",
+    "quintic"
+])
+def test_neighbors_kernels(kernel):
+    """Test neighbors functionality with different kernels."""
+    points, values = _get_test_data_2d()
+    
+    # Create interpolator with neighbors
+    rbf = RBFInterpolator(points, values, kernel=kernel, neighbors=8)
+    
+    # Test points
+    points_test = np.array([[0.3, 0.7], [0.8, 0.2]])
+    
+    # Evaluate
+    values_test = rbf(points_test)
+    
+    # Results should be finite and of correct shape
+    assert values_test.shape == (2,)
+    assert np.all(np.isfinite(values_test))
+
+def test_neighbors_vs_scipy():
+    """Test neighbors against scipy implementation."""
+    points, values = _get_test_data_2d()
+    
+    # Create interpolators
+    rbf_jax = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=10)
+    rbf_scipy = ScipyRBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=10)
+    
+    # Test points
+    points_test = np.array([[0.25, 0.75], [0.6, 0.4]])
+    
+    # Evaluate
+    values_jax = rbf_jax(points_test)
+    values_scipy = rbf_scipy(points_test)
+    
+    # Compare - should be very close
+    np.testing.assert_allclose(values_jax, values_scipy, rtol=1e-8, atol=1e-8)
+
+def test_neighbors_edge_cases():
+    """Test edge cases for neighbors."""
+    points, values = _get_test_data_2d()
+    n_points = len(points)
+    
+    # Test neighbors = 1
+    rbf1 = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=1)
+    points_test = np.array([[0.5, 0.5]])
+    result1 = rbf1(points_test)
+    assert result1.shape == (1,)
+    assert np.isfinite(result1[0])
+    
+    # Test neighbors > number of points (should be clamped)
+    rbf_large = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=n_points + 10)
+    result_large = rbf_large(points_test)
+    assert result_large.shape == (1,)
+    assert np.isfinite(result_large[0])
+    
+    # Test neighbors = all points (should be similar to global)
+    rbf_all = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=n_points)
+    rbf_global = RBFInterpolator(points, values, kernel="thin_plate_spline")
+    
+    result_all = rbf_all(points_test)
+    result_global = rbf_global(points_test)
+    
+    # Should be very close when using all neighbors
+    np.testing.assert_allclose(result_all, result_global, rtol=1e-10, atol=1e-10)
+
+def test_neighbors_with_smoothing():
+    """Test neighbors with smoothing parameter."""
+    points, values = _get_test_data_2d()
+    
+    # Create interpolator with neighbors and smoothing
+    rbf = RBFInterpolator(
+        points, values, 
+        kernel="thin_plate_spline", 
+        neighbors=8, 
+        smoothing=0.1
+    )
+    
+    # Test points
+    points_test = np.array([[0.3, 0.7], [0.8, 0.2]])
+    
+    # Evaluate
+    values_test = rbf(points_test)
+    
+    # Results should be finite and of correct shape
+    assert values_test.shape == (2,)
+    assert np.all(np.isfinite(values_test))
+
+def test_neighbors_jit():
+    """Test that neighbors work with JIT."""
+    points, values = _get_test_data_2d()
+    rbf = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=8)
+    
+    # JIT the evaluation
+    jitted_eval = jax.jit(rbf)
+    
+    # Test points
+    points_test = np.array([[0.3, 0.7], [0.8, 0.2]])
+    
+    # Evaluate both ways
+    values_normal = rbf(points_test)
+    values_jitted = jitted_eval(points_test)
+    
+    # Compare
+    np.testing.assert_allclose(values_normal, values_jitted, rtol=1e-10, atol=1e-10)
+
+def test_neighbors_grad():
+    """Test that neighbors work with gradients."""
+    points, values = _get_test_data_2d()
+    rbf = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=8)
+    
+    def loss(x):
+        return jnp.sum(rbf(x) ** 2)
+    
+    # Test points
+    points_test = np.array([[0.3, 0.7], [0.8, 0.2]])
+    
+    # Compute gradient
+    grad_fn = jax.grad(loss)
+    grad = grad_fn(points_test)
+    
+    # Check that gradient is not None and has correct shape
+    assert grad is not None
+    assert grad.shape == points_test.shape
+    assert np.all(np.isfinite(grad))
+
+def test_neighbors_complex_values():
+    """Test neighbors with complex values."""
+    # Create complex test data
+    x = np.linspace(0, 1, 20)
+    y = np.linspace(0, 1, 20)
+    X, Y = np.meshgrid(x, y)
+    points = np.column_stack((X.ravel(), Y.ravel()))
+    values = np.exp(2j * np.pi * (X + Y)).ravel()
+    
+    # Create interpolator with neighbors
+    rbf = RBFInterpolator(points, values, kernel="thin_plate_spline", neighbors=10)
+    
+    # Test points
+    points_test = np.array([[0.3, 0.7], [0.8, 0.2]])
+    
+    # Evaluate
+    values_test = rbf(points_test)
+    
+    # Results should be finite and of correct shape
+    assert values_test.shape == (2,)
+    assert np.all(np.isfinite(values_test))
+    assert np.iscomplexobj(values_test) 

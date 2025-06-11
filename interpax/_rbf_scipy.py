@@ -1,22 +1,25 @@
-"""Module for RBF interpolation using JAX. Based on scipy implementation."""
+"""Module for RBF interpolation."""
 
-from functools import partial
+import warnings
 from itertools import combinations_with_replacement
-from typing import Optional, Union
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-from jax import jit
-from jax.scipy.linalg import solve
-import jaxkd as jk
+import numpy as np
+from numpy.linalg import LinAlgError
+from scipy.spatial import KDTree
+from scipy.special import comb
+from scipy.linalg.lapack import dgesv  # type: ignore[attr-defined]
 
-from .utils import asarray_inexact
+from ._rbfinterp_pythran import (
+    _build_system,
+    _build_evaluation_coefficients,
+    _polynomial_matrix,
+)
 
 
 __all__ = ["RBFInterpolator"]
 
-# These RBFs are implemented
+
+# These RBFs are implemented.
 _AVAILABLE = {
     "linear",
     "thin_plate_spline",
@@ -28,11 +31,16 @@ _AVAILABLE = {
     "gaussian",
 }
 
-# The shape parameter does not need to be specified when using these RBFs
+
+# The shape parameter does not need to be specified when using these RBFs.
 _SCALE_INVARIANT = {"linear", "thin_plate_spline", "cubic", "quintic"}
 
+
 # For RBFs that are conditionally positive definite of order m, the interpolant
-# should include polynomial terms with degree >= m - 1
+# should include polynomial terms with degree >= m - 1. Define the minimum
+# degrees here. These values are from Chapter 8 of Fasshauer's "Meshfree
+# Approximation Methods with MATLAB". The RBFs that are not in this dictionary
+# are positive definite and do not need polynomial terms.
 _NAME_TO_MIN_DEGREE = {
     "multiquadric": 0,
     "linear": 0,
@@ -42,7 +50,7 @@ _NAME_TO_MIN_DEGREE = {
 }
 
 
-def _monomial_powers(ndim: int, degree: int) -> jax.Array:
+def _monomial_powers(ndim, degree):
     """Return the powers for each monomial in a polynomial.
 
     Parameters
@@ -57,70 +65,24 @@ def _monomial_powers(ndim: int, degree: int) -> jax.Array:
     (nmonos, ndim) int ndarray
         Array where each row contains the powers for each variable in a
         monomial.
+
     """
-    nmonos = jnp.prod(jnp.arange(degree + 1, degree + ndim + 1)) // jnp.prod(
-        jnp.arange(1, ndim + 1)
-    )
-    out = jnp.zeros((nmonos, ndim), dtype=jnp.int32)
+    nmonos = comb(degree + ndim, ndim, exact=True)
+    out = np.zeros((nmonos, ndim), dtype=np.dtype("long"))
     count = 0
     for deg in range(degree + 1):
         for mono in combinations_with_replacement(range(ndim), deg):
             # `mono` is a tuple of variables in the current monomial with
             # multiplicity indicating power (e.g., (0, 1, 1) represents x*y**2)
             for var in mono:
-                out = out.at[count, var].add(1)
+                out[count, var] += 1
             count += 1
 
     return out
 
 
-def _rbf_kernel(r: jax.Array, kernel: str, epsilon: float) -> jax.Array:
-    """Evaluate the RBF kernel function.
-
-    Parameters
-    ----------
-    r : ndarray
-        Distance between points
-    kernel : str
-        Name of the RBF kernel
-    epsilon : float
-        Shape parameter
-
-    Returns
-    -------
-    ndarray
-        Value of the RBF kernel
-    """
-    r = epsilon * r
-    if kernel == "linear":
-        return -r
-    elif kernel == "thin_plate_spline":
-        return jnp.where(r > 0, r**2 * jnp.log(r), 0)
-    elif kernel == "cubic":
-        return r**3
-    elif kernel == "quintic":
-        return -(r**5)
-    elif kernel == "multiquadric":
-        return -jnp.sqrt(1 + r**2)
-    elif kernel == "inverse_multiquadric":
-        return 1 / jnp.sqrt(1 + r**2)
-    elif kernel == "inverse_quadratic":
-        return 1 / (1 + r**2)
-    elif kernel == "gaussian":
-        return jnp.exp(-(r**2))
-    else:
-        raise ValueError(f"Unknown kernel: {kernel}")
-
-
-def _build_system(
-    y: jax.Array,
-    d: jax.Array,
-    smoothing: jax.Array,
-    kernel: str,
-    epsilon: float,
-    powers: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Build the RBF interpolation system of equations.
+def _build_and_solve_system(y, d, smoothing, kernel, epsilon, powers):
+    """Build and solve the RBF interpolation system of equations.
 
     Parameters
     ----------
@@ -139,97 +101,37 @@ def _build_system(
 
     Returns
     -------
-    lhs : (P + R, P + R) float ndarray
-        Left-hand side of the system.
-    rhs : (P + R, S) float ndarray
-        Right-hand side of the system.
-    shift : (N,) float ndarray
-        Domain shift used to create the polynomial matrix.
-    scale : (N,) float ndarray
-        Domain scaling used to create the polynomial matrix.
-    """
-    P, N = y.shape
-    R = powers.shape[0]
-
-    # Compute shift and scale for better conditioning
-    shift = jnp.mean(y, axis=0)
-    scale = jnp.std(y, axis=0)
-    scale = jnp.where(scale == 0, 1, scale)
-
-    # Build the RBF matrix
-    y_shifted = (y - shift) / scale
-    r = jnp.sqrt(jnp.sum((y_shifted[:, None, :] - y_shifted[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel(r, kernel, epsilon)
-
-    # Add smoothing
-    K = K + jnp.diag(smoothing)
-
-    # Build the polynomial matrix
-    if R > 0:
-        poly_matrix = jnp.prod(y_shifted[:, None, :] ** powers[None, :, :], axis=2)
-        lhs = jnp.block([[K, poly_matrix], [poly_matrix.T, jnp.zeros((R, R))]])
-        rhs = jnp.block([[d], [jnp.zeros((R, d.shape[1]))]])
-    else:
-        lhs = K
-        rhs = d
-
-    return lhs, rhs, shift, scale
-
-
-def _build_evaluation_coefficients(
-    x: jax.Array,
-    y: jax.Array,
-    kernel: str,
-    epsilon: float,
-    powers: jax.Array,
-    shift: jax.Array,
-    scale: jax.Array,
-) -> jax.Array:
-    """Build the coefficients for evaluating the RBF interpolant.
-
-    Parameters
-    ----------
-    x : (Q, N) float ndarray
-        Evaluation point coordinates.
-    y : (P, N) float ndarray
-        Data point coordinates.
-    kernel : str
-        Name of the RBF.
-    epsilon : float
-        Shape parameter.
-    powers : (R, N) int ndarray
-        The exponents for each monomial in the polynomial.
+    coeffs : (P + R, S) float ndarray
+        Coefficients for each RBF and monomial.
     shift : (N,) float ndarray
         Domain shift used to create the polynomial matrix.
     scale : (N,) float ndarray
         Domain scaling used to create the polynomial matrix.
 
-    Returns
-    -------
-    (Q, P + R) float ndarray
-        Coefficients for evaluating the RBF interpolant.
     """
-    Q, N = x.shape
-    P, _ = y.shape
-    R = powers.shape[0]
+    lhs, rhs, shift, scale = _build_system(y, d, smoothing, kernel, epsilon, powers)
+    _, _, coeffs, info = dgesv(lhs, rhs, overwrite_a=True, overwrite_b=True)
+    if info < 0:
+        raise ValueError(f"The {-info}-th argument had an illegal value.")
+    elif info > 0:
+        msg = "Singular matrix."
+        nmonos = powers.shape[0]
+        if nmonos > 0:
+            pmat = _polynomial_matrix((y - shift) / scale, powers)
+            rank = np.linalg.matrix_rank(pmat)
+            if rank < nmonos:
+                msg = (
+                    "Singular matrix. The matrix of monomials evaluated at "
+                    "the data point coordinates does not have full column "
+                    f"rank ({rank}/{nmonos})."
+                )
 
-    # Shift and scale the evaluation points
-    x_shifted = (x - shift) / scale
-    y_shifted = (y - shift) / scale
+        raise LinAlgError(msg)
 
-    # Build the RBF matrix
-    r = jnp.sqrt(jnp.sum((x_shifted[:, None, :] - y_shifted[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel(r, kernel, epsilon)
-
-    # Build the polynomial matrix
-    if R > 0:
-        poly_matrix = jnp.prod(x_shifted[:, None, :] ** powers[None, :, :], axis=2)
-        return jnp.block([K, poly_matrix])
-    else:
-        return K
+    return shift, scale, coeffs
 
 
-class RBFInterpolator(eqx.Module):
+class RBFInterpolator:
     """Radial basis function (RBF) interpolation in N dimensions.
 
     Parameters
@@ -279,42 +181,127 @@ class RBFInterpolator(eqx.Module):
 
         The default value is the minimum degree for `kernel` or 0 if there is
         no minimum degree. Set this to -1 for no added polynomial.
-    """
 
-    y: jax.Array
-    d: jax.Array
-    d_shape: tuple
-    d_dtype: type = eqx.field(static=True)
-    neighbors: Optional[int]
-    smoothing: jax.Array
-    kernel: str = eqx.field(static=True)
-    epsilon: float
-    powers: jax.Array
-    _shift: Optional[jax.Array]
-    _scale: Optional[jax.Array]
-    _coeffs: Optional[jax.Array]
-    _tree: Optional[jax.Array]
+    Notes
+    -----
+    An RBF is a scalar valued function in N-dimensional space whose value at
+    :math:`x` can be expressed in terms of :math:`r=||x - c||`, where :math:`c`
+    is the center of the RBF.
+
+    An RBF interpolant for the vector of data values :math:`d`, which are from
+    locations :math:`y`, is a linear combination of RBFs centered at :math:`y`
+    plus a polynomial with a specified degree. The RBF interpolant is written
+    as
+
+    .. math::
+        f(x) = K(x, y) a + P(x) b,
+
+    where :math:`K(x, y)` is a matrix of RBFs with centers at :math:`y`
+    evaluated at the points :math:`x`, and :math:`P(x)` is a matrix of
+    monomials, which span polynomials with the specified degree, evaluated at
+    :math:`x`. The coefficients :math:`a` and :math:`b` are the solution to the
+    linear equations
+
+    .. math::
+        (K(y, y) + \\lambda I) a + P(y) b = d
+
+    and
+
+    .. math::
+        P(y)^T a = 0,
+
+    where :math:`\\lambda` is a non-negative smoothing parameter that controls
+    how well we want to fit the data. The data are fit exactly when the
+    smoothing parameter is 0.
+
+    The above system is uniquely solvable if the following requirements are
+    met:
+
+        - :math:`P(y)` must have full column rank. :math:`P(y)` always has full
+          column rank when `degree` is -1 or 0. When `degree` is 1,
+          :math:`P(y)` has full column rank if the data point locations are not
+          all collinear (N=2), coplanar (N=3), etc.
+        - If `kernel` is 'multiquadric', 'linear', 'thin_plate_spline',
+          'cubic', or 'quintic', then `degree` must not be lower than the
+          minimum value listed above.
+        - If `smoothing` is 0, then each data point location must be distinct.
+
+    When using an RBF that is not scale invariant ('multiquadric',
+    'inverse_multiquadric', 'inverse_quadratic', or 'gaussian'), an appropriate
+    shape parameter must be chosen (e.g., through cross validation). Smaller
+    values for the shape parameter correspond to wider RBFs. The problem can
+    become ill-conditioned or singular when the shape parameter is too small.
+
+    The memory required to solve for the RBF interpolation coefficients
+    increases quadratically with the number of data points, which can become
+    impractical when interpolating more than about a thousand data points.
+    To overcome memory limitations for large interpolation problems, the
+    `neighbors` argument can be specified to compute an RBF interpolant for
+    each evaluation point using only the nearest data points.
+
+    .. versionadded:: 1.7.0
+
+    See Also
+    --------
+    NearestNDInterpolator
+    LinearNDInterpolator
+    CloughTocher2DInterpolator
+
+    References
+    ----------
+    .. [1] Fasshauer, G., 2007. Meshfree Approximation Methods with Matlab.
+        World Scientific Publishing Co.
+
+    .. [2] http://amadeus.math.iit.edu/~fass/603_ch3.pdf
+
+    .. [3] Wahba, G., 1990. Spline Models for Observational Data. SIAM.
+
+    .. [4] http://pages.stat.wisc.edu/~wahba/stat860public/lect/lect8/lect8.pdf
+
+    Examples
+    --------
+    Demonstrate interpolating scattered data to a grid in 2-D.
+
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.interpolate import RBFInterpolator
+    >>> from scipy.stats.qmc import Halton
+
+    >>> rng = np.random.default_rng()
+    >>> xobs = 2*Halton(2, seed=rng).random(100) - 1
+    >>> yobs = np.sum(xobs, axis=1)*np.exp(-6*np.sum(xobs**2, axis=1))
+
+    >>> xgrid = np.mgrid[-1:1:50j, -1:1:50j]
+    >>> xflat = xgrid.reshape(2, -1).T
+    >>> yflat = RBFInterpolator(xobs, yobs)(xflat)
+    >>> ygrid = yflat.reshape(50, 50)
+
+    >>> fig, ax = plt.subplots()
+    >>> ax.pcolormesh(*xgrid, ygrid, vmin=-0.25, vmax=0.25, shading='gouraud')
+    >>> p = ax.scatter(*xobs.T, c=yobs, s=50, ec='k', vmin=-0.25, vmax=0.25)
+    >>> fig.colorbar(p)
+    >>> plt.show()
+
+    """
 
     def __init__(
         self,
-        y: jax.Array,
-        d: jax.Array,
-        neighbors: Optional[int] = None,
-        smoothing: Union[float, jax.Array] = 0.0,
-        kernel: str = "thin_plate_spline",
-        epsilon: Optional[float] = None,
-        degree: Optional[int] = None,
+        y,
+        d,
+        neighbors=None,
+        smoothing=0.0,
+        kernel="thin_plate_spline",
+        epsilon=None,
+        degree=None,
     ):
-        y = asarray_inexact(y)
+        y = np.asarray(y, dtype=float, order="C")
         if y.ndim != 2:
             raise ValueError("`y` must be a 2-dimensional array.")
 
         ny, ndim = y.shape
 
-        d_dtype = complex if jnp.iscomplexobj(d) else float
-        d = asarray_inexact(d)
-        if d.dtype != d_dtype:
-            d = d.astype(d_dtype)
+        d_dtype = complex if np.iscomplexobj(d) else float
+        d = np.asarray(d, dtype=d_dtype, order="C")
         if d.shape[0] != ny:
             raise ValueError(f"Expected the first axis of `d` to have length {ny}.")
 
@@ -325,10 +312,10 @@ class RBFInterpolator(eqx.Module):
         # complex and take up 2x more memory than necessary.
         d = d.view(float)
 
-        if jnp.isscalar(smoothing):
-            smoothing = jnp.full(ny, smoothing, dtype=float)
+        if np.isscalar(smoothing):
+            smoothing = np.full(ny, smoothing, dtype=float)
         else:
-            smoothing = asarray_inexact(smoothing)
+            smoothing = np.asarray(smoothing, dtype=float, order="C")
             if smoothing.shape != (ny,):
                 raise ValueError(
                     f"Expected `smoothing` to be a scalar or have shape ({ny},)."
@@ -357,8 +344,6 @@ class RBFInterpolator(eqx.Module):
             if degree < -1:
                 raise ValueError("`degree` must be at least -1.")
             elif -1 < degree < min_degree:
-                import warnings
-
                 warnings.warn(
                     f"`degree` should not be below {min_degree} except -1 "
                     f"when `kernel` is '{kernel}'."
@@ -388,20 +373,17 @@ class RBFInterpolator(eqx.Module):
             )
 
         if neighbors is None:
-            lhs, rhs, shift, scale = _build_system(
+            shift, scale, coeffs = _build_and_solve_system(
                 y, d, smoothing, kernel, epsilon, powers
             )
-            coeffs = solve(lhs, rhs)
+
+            # Make these attributes private since they do not always exist.
             self._shift = shift
             self._scale = scale
             self._coeffs = coeffs
-            self._tree = None
+
         else:
-            self._shift = None
-            self._scale = None
-            self._coeffs = None
-            # Build the tree for nearest neighbor queries
-            self._tree = jk.build_tree(y)
+            self._tree = KDTree(y)
 
         self.y = y
         self.d = d
@@ -413,30 +395,24 @@ class RBFInterpolator(eqx.Module):
         self.epsilon = epsilon
         self.powers = powers
 
-    def _chunk_evaluator(
-        self,
-        x: jax.Array,
-        y: jax.Array,
-        shift: jax.Array,
-        scale: jax.Array,
-        coeffs: jax.Array,
-        memory_budget: int = 1000000,
-    ) -> jax.Array:
-        """Evaluate the interpolation while controlling memory consumption.
+    def _chunk_evaluator(self, x, y, shift, scale, coeffs, memory_budget=1000000):
+        """
+        Evaluate the interpolation while controlling memory consumption.
+        We chunk the input if we need more memory than specified.
 
         Parameters
         ----------
         x : (Q, N) float ndarray
-            Array of points on which to evaluate
-        y : (P, N) float ndarray
-            Array of points on which we know function values
-        shift : (N,) float ndarray
+            array of points on which to evaluate
+        y: (P, N) float ndarray
+            array of points on which we know function values
+        shift: (N, ) ndarray
             Domain shift used to create the polynomial matrix.
         scale : (N,) float ndarray
             Domain scaling used to create the polynomial matrix.
-        coeffs : (P + R, S) float ndarray
+        coeffs: (P+R, S) float ndarray
             Coefficients in front of basis functions
-        memory_budget : int
+        memory_budget: int
             Total amount of memory (in units of sizeof(float)) we wish
             to devote for storing the array of coefficients for
             interpolated points. If we need more memory than that, we
@@ -445,19 +421,17 @@ class RBFInterpolator(eqx.Module):
         Returns
         -------
         (Q, S) float ndarray
-            Interpolated array
+        Interpolated array
         """
         nx, ndim = x.shape
         if self.neighbors is None:
             nnei = len(y)
         else:
             nnei = self.neighbors
-
         # in each chunk we consume the same space we already occupy
         chunksize = memory_budget // (self.powers.shape[0] + nnei) + 1
-
         if chunksize <= nx:
-            out = jnp.empty((nx, self.d.shape[1]), dtype=float)
+            out = np.empty((nx, self.d.shape[1]), dtype=float)
             for i in range(0, nx, chunksize):
                 vec = _build_evaluation_coefficients(
                     x[i : i + chunksize, :],
@@ -468,16 +442,15 @@ class RBFInterpolator(eqx.Module):
                     shift,
                     scale,
                 )
-                out = out.at[i : i + chunksize, :].set(jnp.dot(vec, coeffs))
+                out[i : i + chunksize, :] = np.dot(vec, coeffs)
         else:
             vec = _build_evaluation_coefficients(
                 x, y, self.kernel, self.epsilon, self.powers, shift, scale
             )
-            out = jnp.dot(vec, coeffs)
-
+            out = np.dot(vec, coeffs)
         return out
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x):
         """Evaluate the interpolant at `x`.
 
         Parameters
@@ -489,8 +462,9 @@ class RBFInterpolator(eqx.Module):
         -------
         (Q, ...) ndarray
             Values of the interpolant at `x`.
+
         """
-        x = asarray_inexact(x)
+        x = np.asarray(x, dtype=float, order="C")
         if x.ndim != 2:
             raise ValueError("`x` must be a 2-dimensional array.")
 
@@ -519,38 +493,45 @@ class RBFInterpolator(eqx.Module):
         else:
             # Get the indices of the k nearest observation points to each
             # evaluation point.
-            neighbors, _ = jk.query_neighbors(self._tree, x, k=self.neighbors)
+            _, yindices = self._tree.query(x, self.neighbors)
             if self.neighbors == 1:
-                # jaxkd may squeeze the output when k=1, ensure it's 2D
-                neighbors = jnp.atleast_2d(neighbors).T
+                # `KDTree` squeezes the output when neighbors=1.
+                yindices = yindices[:, None]
 
-            out = jnp.empty((nx, self.d.shape[1]), dtype=float)
+            # Multiple evaluation points may have the same neighborhood of
+            # observation points. Make the neighborhoods unique so that we only
+            # compute the interpolation coefficients once for each
+            # neighborhood.
+            yindices = np.sort(yindices, axis=1)
+            yindices, inv = np.unique(yindices, return_inverse=True, axis=0)
+            inv = np.reshape(inv, (-1,))  # flatten, we need 1-D indices
+            # `inv` tells us which neighborhood will be used by each evaluation
+            # point. Now we find which evaluation points will be using each
+            # neighborhood.
+            xindices = [[] for _ in range(len(yindices))]
+            for i, j in enumerate(inv):
+                xindices[j].append(i)
 
-            # Process each evaluation point individually
-            # This is simpler but less optimized than the scipy version
-            def process_single_point(xi, neighbors_i):
-                # Extract the neighborhood data
-                ynbr = self.y[neighbors_i]
-                dnbr = self.d[neighbors_i]
-                snbr = self.smoothing[neighbors_i]
-
-                # Build and solve the local system
-                lhs, rhs, shift, scale = _build_system(
-                    ynbr, dnbr, snbr, self.kernel, self.epsilon, self.powers
+            out = np.empty((nx, self.d.shape[1]), dtype=float)
+            for xidx, yidx in zip(xindices, yindices):
+                # `yidx` are the indices of the observations in this
+                # neighborhood. `xidx` are the indices of the evaluation points
+                # that are using this neighborhood.
+                xnbr = x[xidx]
+                ynbr = self.y[yidx]
+                dnbr = self.d[yidx]
+                snbr = self.smoothing[yidx]
+                shift, scale, coeffs = _build_and_solve_system(
+                    ynbr,
+                    dnbr,
+                    snbr,
+                    self.kernel,
+                    self.epsilon,
+                    self.powers,
                 )
-                coeffs = solve(lhs, rhs)
-
-                # Evaluate at the single query point (no chunking needed)
-                xnbr = xi[None, :]  # Add batch dimension
-                vec = _build_evaluation_coefficients(
-                    xnbr, ynbr, self.kernel, self.epsilon, self.powers, shift, scale
+                out[xidx] = self._chunk_evaluator(
+                    xnbr, ynbr, shift, scale, coeffs, memory_budget=memory_budget
                 )
-                result = jnp.dot(vec, coeffs)
-
-                return result[0]  # Extract the single result
-
-            # Use vmap to process all points in parallel
-            out = jax.vmap(process_single_point)(x, neighbors)
 
         out = out.view(self.d_dtype)
         out = out.reshape((nx,) + self.d_shape)

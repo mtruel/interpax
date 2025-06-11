@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "equinox>=0.12.2",
-    "jax>=0.6.0",
+    "jax[cuda]>=0.6.0",
+    "jaxkd>=0.1.0",
     "lineax>=0.0.8",
     "numpy>=2.2.6",
     "pytest>=8.3.5",
+    "scipy>=1.15.3",
 ]
