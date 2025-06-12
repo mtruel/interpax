@@ -19,5 +19,6 @@ from ._spline import (
     interp2d,
     interp3d,
 )
+from ._rbf import RBFInterpolator
 
 __version__ = _version.get_versions()["version"]

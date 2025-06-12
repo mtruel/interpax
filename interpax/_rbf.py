@@ -92,6 +92,24 @@ def _rbf_kernel(r: jax.Array, kernel: str, epsilon: float) -> jax.Array:
         Value of the RBF kernel
     """
     r = epsilon * r
+    return _rbf_kernel_direct(r, kernel)
+
+
+def _rbf_kernel_direct(r: jax.Array, kernel: str) -> jax.Array:
+    """Evaluate the RBF kernel function with pre-scaled distances.
+
+    Parameters
+    ----------
+    r : ndarray
+        Distance between points (already scaled by epsilon)
+    kernel : str
+        Name of the RBF kernel
+
+    Returns
+    -------
+    ndarray
+        Value of the RBF kernel
+    """
     if kernel == "linear":
         return -r
     elif kernel == "thin_plate_spline":
@@ -151,22 +169,30 @@ def _build_system(
     P, N = y.shape
     R = powers.shape[0]
 
-    # Compute shift and scale for better conditioning
-    shift = jnp.mean(y, axis=0)
-    scale = jnp.std(y, axis=0)
-    scale = jnp.where(scale == 0, 1, scale)
+    # Shift and scale the polynomial domain to be between -1 and 1 (match SciPy)
+    mins = jnp.min(y, axis=0)
+    maxs = jnp.max(y, axis=0)
+    shift = (maxs + mins) / 2
+    scale = (maxs - mins) / 2
+    # The scale may be zero if there is a single point or all the points have
+    # the same value for some dimension. Avoid division by zero by replacing
+    # zeros with ones.
+    scale = jnp.where(scale == 0.0, 1.0, scale)
 
-    # Build the RBF matrix
-    y_shifted = (y - shift) / scale
-    r = jnp.sqrt(jnp.sum((y_shifted[:, None, :] - y_shifted[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel(r, kernel, epsilon)
+    # Apply epsilon scaling to coordinates (match SciPy order)
+    yeps = y * epsilon
+    yhat = (y - shift) / scale
 
-    # Add smoothing
+    # Build the RBF matrix - use epsilon-scaled coordinates directly
+    r = jnp.sqrt(jnp.sum((yeps[:, None, :] - yeps[None, :, :]) ** 2, axis=2))
+    K = _rbf_kernel_direct(r, kernel)
+
+    # Add smoothing to diagonal
     K = K + jnp.diag(smoothing)
 
-    # Build the polynomial matrix
+    # Build the polynomial matrix using transformed coordinates
     if R > 0:
-        poly_matrix = jnp.prod(y_shifted[:, None, :] ** powers[None, :, :], axis=2)
+        poly_matrix = jnp.prod(yhat[:, None, :] ** powers[None, :, :], axis=2)
         lhs = jnp.block([[K, poly_matrix], [poly_matrix.T, jnp.zeros((R, R))]])
         rhs = jnp.block([[d], [jnp.zeros((R, d.shape[1]))]])
     else:
@@ -213,17 +239,18 @@ def _build_evaluation_coefficients(
     P, _ = y.shape
     R = powers.shape[0]
 
-    # Shift and scale the evaluation points
-    x_shifted = (x - shift) / scale
-    y_shifted = (y - shift) / scale
+    # Apply epsilon scaling to coordinates (match SciPy order)
+    yeps = y * epsilon
+    xeps = x * epsilon
+    xhat = (x - shift) / scale
 
-    # Build the RBF matrix
-    r = jnp.sqrt(jnp.sum((x_shifted[:, None, :] - y_shifted[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel(r, kernel, epsilon)
+    # Build the RBF matrix using epsilon-scaled coordinates
+    r = jnp.sqrt(jnp.sum((xeps[:, None, :] - yeps[None, :, :]) ** 2, axis=2))
+    K = _rbf_kernel_direct(r, kernel)
 
-    # Build the polynomial matrix
+    # Build the polynomial matrix using transformed coordinates
     if R > 0:
-        poly_matrix = jnp.prod(x_shifted[:, None, :] ** powers[None, :, :], axis=2)
+        poly_matrix = jnp.prod(xhat[:, None, :] ** powers[None, :, :], axis=2)
         return jnp.block([K, poly_matrix])
     else:
         return K
@@ -549,8 +576,21 @@ class RBFInterpolator(eqx.Module):
 
                 return result[0]  # Extract the single result
 
-            # Use vmap to process all points in parallel
-            out = jax.vmap(process_single_point)(x, neighbors)
+            # Process points in chunks to stay within memory budget
+            chunk_size = max(1, int(memory_budget / (self.neighbors * self.d.shape[1])))
+            num_chunks = (nx + chunk_size - 1) // chunk_size  # Ceiling division
+            
+            # Process each chunk using vmap
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, nx)
+                x_chunk = x[start_idx:end_idx]
+                neighbors_chunk = neighbors[start_idx:end_idx]
+                
+                # Use vmap to process points in this chunk in parallel
+                out = out.at[start_idx:end_idx].set(
+                    jax.vmap(process_single_point)(x_chunk, neighbors_chunk)
+                )
 
         out = out.view(self.d_dtype)
         out = out.reshape((nx,) + self.d_shape)
