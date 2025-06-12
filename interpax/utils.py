@@ -1,7 +1,6 @@
 """Util functions for interpax."""
 
-import warnings
-
+import jax.debug
 import jax.numpy as jnp
 
 
@@ -21,9 +20,9 @@ def errorif(cond, err=ValueError, msg=""):
 
 
 def warnif(cond, err=UserWarning, msg=""):
-    """Throw a warning if condition is met."""
+    """Throw a warning if condition is met using JAX-compatible debug print."""
     if cond:
-        warnings.warn(msg, err)
+        jax.debug.print("WARNING: {}", msg)
 
 
 def asarray_inexact(x):

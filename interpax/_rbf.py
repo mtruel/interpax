@@ -7,6 +7,8 @@ from typing import Optional, Union
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.lax
+import jax.debug
 from jax import jit
 from jax.scipy.linalg import solve
 import jaxkd as jk
@@ -74,15 +76,15 @@ def _monomial_powers(ndim: int, degree: int) -> jax.Array:
     return out
 
 
-def _rbf_kernel(r: jax.Array, kernel: str, epsilon: float) -> jax.Array:
+def _rbf_kernel(r: jax.Array, kernel_index: int, epsilon: float) -> jax.Array:
     """Evaluate the RBF kernel function.
 
     Parameters
     ----------
     r : ndarray
         Distance between points
-    kernel : str
-        Name of the RBF kernel
+    kernel_index : int
+        Index of the RBF kernel in _KERNEL_FUNCTIONS
     epsilon : float
         Shape parameter
 
@@ -92,49 +94,32 @@ def _rbf_kernel(r: jax.Array, kernel: str, epsilon: float) -> jax.Array:
         Value of the RBF kernel
     """
     r = epsilon * r
-    return _rbf_kernel_direct(r, kernel)
+    return _rbf_kernel_direct(r, kernel_index)
 
 
-def _rbf_kernel_direct(r: jax.Array, kernel: str) -> jax.Array:
-    """Evaluate the RBF kernel function with pre-scaled distances.
+def _rbf_kernel_direct(r: jax.Array, kernel_index: int) -> jax.Array:
+    """Evaluate the RBF kernel function with pre-scaled distances using JAX-compatible dispatch.
 
     Parameters
     ----------
     r : ndarray
         Distance between points (already scaled by epsilon)
-    kernel : str
-        Name of the RBF kernel
+    kernel_index : int
+        Index of the RBF kernel in _KERNEL_FUNCTIONS
 
     Returns
     -------
     ndarray
         Value of the RBF kernel
     """
-    if kernel == "linear":
-        return -r
-    elif kernel == "thin_plate_spline":
-        return jnp.where(r > 0, r**2 * jnp.log(r), 0)
-    elif kernel == "cubic":
-        return r**3
-    elif kernel == "quintic":
-        return -(r**5)
-    elif kernel == "multiquadric":
-        return -jnp.sqrt(1 + r**2)
-    elif kernel == "inverse_multiquadric":
-        return 1 / jnp.sqrt(1 + r**2)
-    elif kernel == "inverse_quadratic":
-        return 1 / (1 + r**2)
-    elif kernel == "gaussian":
-        return jnp.exp(-(r**2))
-    else:
-        raise ValueError(f"Unknown kernel: {kernel}")
+    return jax.lax.switch(kernel_index, _KERNEL_FUNCTIONS, r)
 
 
 def _build_system(
     y: jax.Array,
     d: jax.Array,
     smoothing: jax.Array,
-    kernel: str,
+    kernel_index: int,
     epsilon: float,
     powers: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -148,8 +133,8 @@ def _build_system(
         Data values at `y`.
     smoothing : (P,) float ndarray
         Smoothing parameter for each data point.
-    kernel : str
-        Name of the RBF.
+    kernel_index : int
+        Index of the RBF kernel in _KERNEL_FUNCTIONS.
     epsilon : float
         Shape parameter.
     powers : (R, N) int ndarray
@@ -185,7 +170,7 @@ def _build_system(
 
     # Build the RBF matrix - use epsilon-scaled coordinates directly
     r = jnp.sqrt(jnp.sum((yeps[:, None, :] - yeps[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel_direct(r, kernel)
+    K = _rbf_kernel_direct(r, kernel_index)
 
     # Add smoothing to diagonal
     K = K + jnp.diag(smoothing)
@@ -205,7 +190,7 @@ def _build_system(
 def _build_evaluation_coefficients(
     x: jax.Array,
     y: jax.Array,
-    kernel: str,
+    kernel_index: int,
     epsilon: float,
     powers: jax.Array,
     shift: jax.Array,
@@ -219,8 +204,8 @@ def _build_evaluation_coefficients(
         Evaluation point coordinates.
     y : (P, N) float ndarray
         Data point coordinates.
-    kernel : str
-        Name of the RBF.
+    kernel_index : int
+        Index of the RBF kernel in _KERNEL_FUNCTIONS.
     epsilon : float
         Shape parameter.
     powers : (R, N) int ndarray
@@ -246,7 +231,7 @@ def _build_evaluation_coefficients(
 
     # Build the RBF matrix using epsilon-scaled coordinates
     r = jnp.sqrt(jnp.sum((xeps[:, None, :] - yeps[None, :, :]) ** 2, axis=2))
-    K = _rbf_kernel_direct(r, kernel)
+    K = _rbf_kernel_direct(r, kernel_index)
 
     # Build the polynomial matrix using transformed coordinates
     if R > 0:
@@ -254,6 +239,82 @@ def _build_evaluation_coefficients(
         return jnp.block([K, poly_matrix])
     else:
         return K
+
+
+# Define individual kernel functions for JAX compatibility
+def _linear_kernel(r: jax.Array) -> jax.Array:
+    """Linear RBF kernel: -r"""
+    return -r
+
+
+def _thin_plate_spline_kernel(r: jax.Array) -> jax.Array:
+    """Thin plate spline RBF kernel: r^2 * log(r)"""
+    return jnp.where(r > 0, r**2 * jnp.log(r), 0.0)
+
+
+def _cubic_kernel(r: jax.Array) -> jax.Array:
+    """Cubic RBF kernel: r^3"""
+    return r**3
+
+
+def _quintic_kernel(r: jax.Array) -> jax.Array:
+    """Quintic RBF kernel: -r^5"""
+    return -(r**5)
+
+
+def _multiquadric_kernel(r: jax.Array) -> jax.Array:
+    """Multiquadric RBF kernel: -sqrt(1 + r^2)"""
+    return -jnp.sqrt(1 + r**2)
+
+
+def _inverse_multiquadric_kernel(r: jax.Array) -> jax.Array:
+    """Inverse multiquadric RBF kernel: 1/sqrt(1 + r^2)"""
+    return 1 / jnp.sqrt(1 + r**2)
+
+
+def _inverse_quadratic_kernel(r: jax.Array) -> jax.Array:
+    """Inverse quadratic RBF kernel: 1/(1 + r^2)"""
+    return 1 / (1 + r**2)
+
+
+def _gaussian_kernel(r: jax.Array) -> jax.Array:
+    """Gaussian RBF kernel: exp(-r^2)"""
+    return jnp.exp(-(r**2))
+
+
+# Kernel function list for jax.lax.switch (order must match _KERNEL_NAMES)
+_KERNEL_FUNCTIONS = [
+    _cubic_kernel,
+    _gaussian_kernel,
+    _inverse_multiquadric_kernel,
+    _inverse_quadratic_kernel,
+    _linear_kernel,
+    _multiquadric_kernel,
+    _quintic_kernel,
+    _thin_plate_spline_kernel,
+]
+
+# Ordered list of kernel names (sorted alphabetically for consistency)
+_KERNEL_NAMES = [
+    "cubic",
+    "gaussian",
+    "inverse_multiquadric",
+    "inverse_quadratic",
+    "linear",
+    "multiquadric",
+    "quintic",
+    "thin_plate_spline",
+]
+
+# Create mapping from name to index
+_KERNEL_NAME_TO_INDEX = {name: i for i, name in enumerate(_KERNEL_NAMES)}
+
+
+def _get_kernel_index(kernel: str) -> int:
+    """Get the index for a kernel name."""
+    if kernel not in _AVAILABLE:
+        raise ValueError(f"`kernel` must be one of {_AVAILABLE}.")
+    return _KERNEL_NAME_TO_INDEX[kernel]
 
 
 class RBFInterpolator(eqx.Module):
@@ -315,6 +376,7 @@ class RBFInterpolator(eqx.Module):
     neighbors: Optional[int]
     smoothing: jax.Array
     kernel: str = eqx.field(static=True)
+    kernel_index: int = eqx.field(static=True)
     epsilon: float
     powers: jax.Array
     _shift: Optional[jax.Array]
@@ -384,17 +446,15 @@ class RBFInterpolator(eqx.Module):
             if degree < -1:
                 raise ValueError("`degree` must be at least -1.")
             elif -1 < degree < min_degree:
-                import warnings
-
-                warnings.warn(
-                    f"`degree` should not be below {min_degree} except -1 "
-                    f"when `kernel` is '{kernel}'."
+                # Use JAX debug print instead of Python warnings for JAX compatibility
+                warning_msg = (
+                    f"WARNING: `degree` should not be below {min_degree} except -1 "
+                    f"when `kernel` is '{kernel}'. "
                     f"The interpolant may not be uniquely "
                     f"solvable, and the smoothing parameter may have an "
-                    f"unintuitive effect.",
-                    UserWarning,
-                    stacklevel=2,
+                    f"unintuitive effect."
                 )
+                jax.debug.print("RBF Interpolator Warning: {}", warning_msg)
 
         if neighbors is None:
             nobs = ny
@@ -414,9 +474,12 @@ class RBFInterpolator(eqx.Module):
                 f"`degree` is {degree} and the number of dimensions is {ndim}."
             )
 
+        # Get kernel index for JAX-compatible dispatch
+        kernel_index = _get_kernel_index(kernel)
+
         if neighbors is None:
             lhs, rhs, shift, scale = _build_system(
-                y, d, smoothing, kernel, epsilon, powers
+                y, d, smoothing, kernel_index, epsilon, powers
             )
             coeffs = solve(lhs, rhs)
             self._shift = shift
@@ -437,6 +500,7 @@ class RBFInterpolator(eqx.Module):
         self.neighbors = neighbors
         self.smoothing = smoothing
         self.kernel = kernel
+        self.kernel_index = kernel_index
         self.epsilon = epsilon
         self.powers = powers
 
@@ -489,7 +553,7 @@ class RBFInterpolator(eqx.Module):
                 vec = _build_evaluation_coefficients(
                     x[i : i + chunksize, :],
                     y,
-                    self.kernel,
+                    self.kernel_index,
                     self.epsilon,
                     self.powers,
                     shift,
@@ -498,7 +562,7 @@ class RBFInterpolator(eqx.Module):
                 out = out.at[i : i + chunksize, :].set(jnp.dot(vec, coeffs))
         else:
             vec = _build_evaluation_coefficients(
-                x, y, self.kernel, self.epsilon, self.powers, shift, scale
+                x, y, self.kernel_index, self.epsilon, self.powers, shift, scale
             )
             out = jnp.dot(vec, coeffs)
 
@@ -563,14 +627,20 @@ class RBFInterpolator(eqx.Module):
 
                 # Build and solve the local system
                 lhs, rhs, shift, scale = _build_system(
-                    ynbr, dnbr, snbr, self.kernel, self.epsilon, self.powers
+                    ynbr, dnbr, snbr, self.kernel_index, self.epsilon, self.powers
                 )
                 coeffs = solve(lhs, rhs)
 
                 # Evaluate at the single query point (no chunking needed)
                 xnbr = xi[None, :]  # Add batch dimension
                 vec = _build_evaluation_coefficients(
-                    xnbr, ynbr, self.kernel, self.epsilon, self.powers, shift, scale
+                    xnbr,
+                    ynbr,
+                    self.kernel_index,
+                    self.epsilon,
+                    self.powers,
+                    shift,
+                    scale,
                 )
                 result = jnp.dot(vec, coeffs)
 
@@ -579,14 +649,14 @@ class RBFInterpolator(eqx.Module):
             # Process points in chunks to stay within memory budget
             chunk_size = max(1, int(memory_budget / (self.neighbors * self.d.shape[1])))
             num_chunks = (nx + chunk_size - 1) // chunk_size  # Ceiling division
-            
+
             # Process each chunk using vmap
             for i in range(num_chunks):
                 start_idx = i * chunk_size
                 end_idx = min(start_idx + chunk_size, nx)
                 x_chunk = x[start_idx:end_idx]
                 neighbors_chunk = neighbors[start_idx:end_idx]
-                
+
                 # Use vmap to process points in this chunk in parallel
                 out = out.at[start_idx:end_idx].set(
                     jax.vmap(process_single_point)(x_chunk, neighbors_chunk)
