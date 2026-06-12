@@ -26,6 +26,7 @@ except where noted in the documentation.
     :recursive:
     :template: class.rst
 
+    interpax.NearestNDInterpolator
     interpax.Akima1DInterpolator
     interpax.CubicHermiteSpline
     interpax.CubicSpline

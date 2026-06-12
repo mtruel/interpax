@@ -38,6 +38,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import io
 import warnings
 
+import equinox as eqx
+import jax
 import numpy as np
 import pytest
 import scipy.interpolate
@@ -56,6 +58,7 @@ from interpax import (
     Akima1DInterpolator,
     CubicHermiteSpline,
     CubicSpline,
+    NearestNDInterpolator,
     PchipInterpolator,
     PPoly,
     RBFInterpolator,
@@ -1273,3 +1276,167 @@ class TestRBFInterpolator:
         values_scipy = rbf_scipy(x_test)
 
         assert_allclose(values_jax, values_scipy, rtol=1e-8, atol=1e-8)
+class TestNearestNDInterpolator:
+    def test_exact_at_data_points(self):
+        rng = np.random.default_rng(0)
+        x = rng.random((20, 2))
+        y = np.sin(x[:, 0]) * np.cos(x[:, 1])
+
+        interp_jax = NearestNDInterpolator(x, y)
+        interp_scipy = scipy.interpolate.NearestNDInterpolator(x, y)
+
+        assert_allclose(interp_jax(x), y, rtol=1e-14)
+        assert_allclose(interp_jax(x), interp_scipy(x), rtol=1e-14)
+
+    def test_broadcastable_input(self):
+        rng = np.random.default_rng(1)
+        x = rng.random(10)
+        y = rng.random(10)
+        z = np.hypot(x, y)
+        points = np.column_stack([x, y])
+
+        X = np.linspace(x.min(), x.max(), 8)
+        Y = np.linspace(y.min(), y.max(), 9)
+        Xg, Yg = np.meshgrid(X, Y)
+        XY = np.column_stack([Xg.ravel(), Yg.ravel()])
+
+        interp_jax = NearestNDInterpolator(points, z)
+        interp_scipy = scipy.interpolate.NearestNDInterpolator(points, z)
+
+        assert_allclose(interp_jax(XY), interp_scipy(XY), rtol=1e-14)
+        assert_allclose(interp_jax((Xg, Yg)), interp_scipy((Xg, Yg)), rtol=1e-14)
+        assert_allclose(interp_jax(Xg, Yg), interp_scipy(Xg, Yg), rtol=1e-14)
+
+    def test_multivalue(self):
+        x = np.array(
+            [(0, 0), (-0.5, -0.5), (-0.5, 0.5), (0.5, 0.5), (0.25, 0.3)],
+            dtype=np.float64,
+        )
+        y = np.arange(x.shape[0], dtype=np.float64)[:, None] + np.array([0, 1])[None, :]
+
+        interp_jax = NearestNDInterpolator(x, y)
+        interp_scipy = scipy.interpolate.NearestNDInterpolator(x, y)
+
+        assert_allclose(interp_jax(x), y, rtol=1e-14)
+        assert_allclose(interp_jax(x), interp_scipy(x), rtol=1e-14)
+
+    def test_rescale(self):
+        points = np.array(
+            [(0, 0), (0, 100), (10, 100), (10, 0), (1, 5)],
+            dtype=np.float64,
+        )
+        values = np.array([1.0, 2.0, -3.0, 5.0, 9.0], dtype=np.float64)
+        points_rescaled = np.array(
+            [(0, 0), (0, 1), (1, 1), (1, 0), (0.1, 0.05)],
+            dtype=np.float64,
+        )
+
+        xx, yy = np.broadcast_arrays(
+            np.linspace(0, 10, 14)[:, None], np.linspace(0, 100, 14)[None, :]
+        )
+        xi = np.column_stack([xx.ravel(), yy.ravel()])
+
+        zi = scipy.interpolate.NearestNDInterpolator(points_rescaled, values)(
+            xi / np.array([10, 100.0])
+        )
+        zi_rescaled_jax = NearestNDInterpolator(points, values, rescale=True)(xi)
+        zi_rescaled_scipy = scipy.interpolate.NearestNDInterpolator(
+            points, values, rescale=True
+        )(xi)
+
+        assert_allclose(zi_rescaled_jax, zi, rtol=1e-12)
+        assert_allclose(zi_rescaled_jax, zi_rescaled_scipy, rtol=1e-12)
+
+    def test_distance_upper_bound(self):
+        nd = np.array(
+            [[0, 0.5, 0, 1], [0, 0, 0.5, 1], [0, 1, 1, 2]],
+            dtype=np.float64,
+        )
+        delta = 0.1
+        query_points = ([0 + delta, 1 + delta], [0 + delta, 1 + delta])
+        distance_upper_bound = np.sqrt(delta**2 + delta**2) - 1e-7
+
+        interp_jax = NearestNDInterpolator((nd[0], nd[1]), nd[2])
+        interp_scipy = scipy.interpolate.NearestNDInterpolator((nd[0], nd[1]), nd[2])
+
+        yi_jax = interp_jax(query_points, distance_upper_bound=distance_upper_bound)
+        yi_scipy = interp_scipy(query_points, distance_upper_bound=distance_upper_bound)
+        assert_allclose(yi_jax, yi_scipy, rtol=1e-14, equal_nan=True)
+
+        distance_upper_bound = np.sqrt(delta**2 + delta**2) + 1e-7
+        yi_jax = interp_jax(query_points, distance_upper_bound=distance_upper_bound)
+        yi_scipy = interp_scipy(query_points, distance_upper_bound=distance_upper_bound)
+        assert_allclose(yi_jax, yi_scipy, rtol=1e-14)
+
+    def test_scipy_random_comparison(self):
+        rng = np.random.default_rng(42)
+        points = rng.random((50, 3))
+        values = rng.random(50)
+        # Avoid exact midpoints where tie-breaking may differ.
+        queries = points + 0.03 * rng.standard_normal(points.shape)
+
+        interp_jax = NearestNDInterpolator(points, values)
+        interp_scipy = scipy.interpolate.NearestNDInterpolator(points, values)
+
+        assert_allclose(interp_jax(queries), interp_scipy(queries), rtol=1e-14)
+
+    def test_jit_smoke(self):
+        x = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        y = np.array([0.0, 1.0, 2.0, 3.0])
+        interp = NearestNDInterpolator(x, y)
+        query = np.array([[0.2, 0.3], [0.8, 0.7]])
+
+        jitted = eqx.filter_jit(interp)
+        assert_allclose(jitted(query), interp(query), rtol=1e-14)
+
+    def test_ad(self):
+        """Test jax.grad, jacfwd, and jacrev on interior query points."""
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = NearestNDInterpolator(points, values)
+
+        # Well inside Voronoi cells; nearest neighbor is locally constant.
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(q):
+            return interp(q[None, :])[0]
+
+        grad = jax.grad(scalar_out)(query)
+        jacfwd = jax.jacfwd(scalar_out)(query)
+        jacrev = jax.jacrev(scalar_out)(query)
+
+        assert_allclose(grad, 0.0, atol=1e-14)
+        assert_allclose(jacfwd, 0.0, atol=1e-14)
+        assert_allclose(jacrev, 0.0, atol=1e-14)
+        assert_allclose(grad, jacfwd, atol=1e-14)
+        assert_allclose(grad, jacrev, atol=1e-14)
+        assert_allclose(jacfwd, jacrev, atol=1e-14)
+
+    def test_ad_vector_output(self):
+        """Test AD transforms for vector-valued interpolant output."""
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array(
+            [[0.0, 10.0], [1.0, 11.0], [2.0, 12.0], [3.0, 13.0]], dtype=np.float64
+        )
+        interp = NearestNDInterpolator(points, values)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def vector_out(q):
+            return interp(q[None, :])[0]
+
+        jacfwd = jax.jacfwd(vector_out)(query)
+        jacrev = jax.jacrev(vector_out)(query)
+
+        assert_allclose(jacfwd, 0.0, atol=1e-14)
+        assert_allclose(jacrev, 0.0, atol=1e-14)
+        assert_allclose(jacfwd, jacrev, atol=1e-14)
+
+        for i in range(values.shape[1]):
+            grad_i = jax.grad(lambda q, idx=i: vector_out(q)[idx])(query)
+            assert_allclose(grad_i, 0.0, atol=1e-14)
+            assert_allclose(grad_i, jacfwd[i], atol=1e-14)
+            assert_allclose(grad_i, jacrev[i], atol=1e-14)

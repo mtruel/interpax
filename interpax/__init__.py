@@ -3,6 +3,7 @@
 from . import _version
 from ._fd_derivs import approx_df
 from ._fourier import fft_interp1d, fft_interp2d
+from ._ndgriddata import NearestNDInterpolator
 from ._ppoly import (
     Akima1DInterpolator,
     CubicHermiteSpline,
@@ -25,6 +26,7 @@ __all__ = [
     "approx_df",
     "fft_interp1d",
     "fft_interp2d",
+    "NearestNDInterpolator",
     "Akima1DInterpolator",
     "CubicHermiteSpline",
     "CubicSpline",
