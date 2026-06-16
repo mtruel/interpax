@@ -1,6 +1,14 @@
 Changelog
 =========
 
+Unreleased
+----------
+- Add ``frozen_points`` option to ``interpax.LinearNDInterpolator`` for
+  memory-efficient evaluation with fixed vertex geometry (precomputed
+  barycentric transforms and ``jaxkd`` incident-simplex search).
+- Add ``interpax.LinearNDInterpolator``, a JAX-compatible piecewise linear
+  interpolator for unstructured N-D data (``scipy.interpolate.LinearNDInterpolator``).
+
 - Adds a number of classes that replicate most of the functionality of the
 corresponding classes from scipy.interpolate :
   - ``scipy.interpolate.PPoly`` -> ``interpax.PPoly``

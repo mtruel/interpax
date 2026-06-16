@@ -58,6 +58,7 @@ from interpax import (
     Akima1DInterpolator,
     CubicHermiteSpline,
     CubicSpline,
+    LinearNDInterpolator,
     NearestNDInterpolator,
     PchipInterpolator,
     PPoly,
@@ -1440,3 +1441,255 @@ class TestNearestNDInterpolator:
             assert_allclose(grad_i, 0.0, atol=1e-14)
             assert_allclose(grad_i, jacfwd[i], atol=1e-14)
             assert_allclose(grad_i, jacrev[i], atol=1e-14)
+
+
+class TestLinearNDInterpolator:
+    def test_exact_at_data_points(self):
+        rng = np.random.default_rng(0)
+        x = rng.random((20, 2))
+        y = np.sin(x[:, 0]) * np.cos(x[:, 1])
+
+        interp_jax = LinearNDInterpolator(x, y)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(x, y)
+
+        assert_allclose(interp_jax(x), y, rtol=1e-12)
+        assert_allclose(interp_jax(x), interp_scipy(x), rtol=1e-12)
+
+    def test_broadcastable_input(self):
+        rng = np.random.default_rng(1)
+        x = rng.random(10)
+        y = rng.random(10)
+        z = np.hypot(x, y)
+        points = np.column_stack([x, y])
+
+        X = np.linspace(x.min(), x.max(), 8)
+        Y = np.linspace(y.min(), y.max(), 9)
+        Xg, Yg = np.meshgrid(X, Y)
+        XY = np.column_stack([Xg.ravel(), Yg.ravel()])
+
+        interp_jax = LinearNDInterpolator(points, z)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(points, z)
+
+        assert_allclose(interp_jax(XY), interp_scipy(XY), rtol=1e-10, equal_nan=True)
+        assert_allclose(
+            interp_jax((Xg, Yg)), interp_scipy((Xg, Yg)), rtol=1e-10, equal_nan=True
+        )
+        assert_allclose(
+            interp_jax(Xg, Yg), interp_scipy(Xg, Yg), rtol=1e-10, equal_nan=True
+        )
+
+    def test_multivalue(self):
+        x = np.array(
+            [(0, 0), (-0.5, -0.5), (-0.5, 0.5), (0.5, 0.5), (0.25, 0.3)],
+            dtype=np.float64,
+        )
+        y = np.arange(x.shape[0], dtype=np.float64)[:, None] + np.array([0, 1])[None, :]
+
+        interp_jax = LinearNDInterpolator(x, y)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(x, y)
+
+        assert_allclose(interp_jax(x), y, rtol=1e-12)
+        assert_allclose(interp_jax(x), interp_scipy(x), rtol=1e-12)
+
+    def test_rescale(self):
+        points = np.array(
+            [(0, 0), (0, 100), (10, 100), (10, 0), (1, 5)],
+            dtype=np.float64,
+        )
+        values = np.array([1.0, 2.0, -3.0, 5.0, 9.0], dtype=np.float64)
+        points_rescaled = np.array(
+            [(0, 0), (0, 1), (1, 1), (1, 0), (0.1, 0.05)],
+            dtype=np.float64,
+        )
+
+        xx, yy = np.broadcast_arrays(
+            np.linspace(0, 10, 14)[:, None], np.linspace(0, 100, 14)[None, :]
+        )
+        xi = np.column_stack([xx.ravel(), yy.ravel()])
+
+        zi = scipy.interpolate.LinearNDInterpolator(points_rescaled, values)(
+            xi / np.array([10, 100.0])
+        )
+        zi_rescaled_jax = LinearNDInterpolator(points, values, rescale=True)(xi)
+        zi_rescaled_scipy = scipy.interpolate.LinearNDInterpolator(
+            points, values, rescale=True
+        )(xi)
+
+        assert_allclose(zi_rescaled_jax, zi, rtol=1e-10, equal_nan=True)
+        assert_allclose(
+            zi_rescaled_jax, zi_rescaled_scipy, rtol=1e-10, equal_nan=True
+        )
+
+    def test_outside_hull(self):
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp_jax = LinearNDInterpolator(points, values)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(points, values)
+
+        query = np.array([[2.0, 2.0], [-1.0, 0.5]], dtype=np.float64)
+        assert_allclose(interp_jax(query), interp_scipy(query), equal_nan=True)
+
+    def test_scipy_random_comparison(self):
+        rng = np.random.default_rng(42)
+        points = rng.random((50, 3))
+        values = rng.random(50)
+        queries = points + 0.03 * rng.standard_normal(points.shape)
+
+        interp_jax = LinearNDInterpolator(points, values)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(points, values)
+
+        assert_allclose(interp_jax(queries), interp_scipy(queries), rtol=1e-10)
+
+    def test_precomputed_delaunay(self):
+        from scipy.spatial import Delaunay
+
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        tri = Delaunay(points)
+        query = np.array([[0.25, 0.35]], dtype=np.float64)
+
+        interp_jax = LinearNDInterpolator(tri, values)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(tri, values)
+
+        assert_allclose(interp_jax(query), interp_scipy(query), rtol=1e-12)
+
+    def test_jit_smoke(self):
+        x = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        y = np.array([0.0, 1.0, 2.0, 3.0])
+        interp = LinearNDInterpolator(x, y)
+        query = np.array([[0.2, 0.3], [0.8, 0.7]])
+
+        jitted = eqx.filter_jit(interp)
+        assert_allclose(jitted(query), interp(query), rtol=1e-12)
+
+    def test_ad_query(self):
+        """Grad w.r.t. query point inside a simplex is nonzero and consistent."""
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = LinearNDInterpolator(points, values)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(q):
+            return interp(q[None, :])[0]
+
+        grad = jax.grad(scalar_out)(query)
+        jacfwd = jax.jacfwd(scalar_out)(query)
+        jacrev = jax.jacrev(scalar_out)(query)
+
+        assert not np.allclose(grad, 0.0)
+        assert_allclose(grad, jacfwd, atol=1e-12)
+        assert_allclose(grad, jacrev, atol=1e-12)
+        assert_allclose(jacfwd, jacrev, atol=1e-12)
+
+    def test_ad_values(self):
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = LinearNDInterpolator(points, values)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(vals):
+            mod = eqx.tree_at(lambda t: t.values, interp, vals)
+            return mod(query[None, :])[0]
+
+        grad = jax.grad(scalar_out)(values)
+        assert not np.allclose(grad, 0.0)
+
+    def test_ad_points(self):
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = LinearNDInterpolator(points, values)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(pts):
+            mod = eqx.tree_at(lambda t: t.points, interp, pts)
+            return mod(query[None, :])[0]
+
+        grad = jax.grad(scalar_out)(points)
+        eps = 1e-5
+        fd = np.zeros_like(points)
+        for i in range(points.shape[0]):
+            for j in range(points.shape[1]):
+                pts_p = points.copy()
+                pts_m = points.copy()
+                pts_p[i, j] += eps
+                pts_m[i, j] -= eps
+                fd[i, j] = (scalar_out(pts_p) - scalar_out(pts_m)) / (2 * eps)
+
+        assert_allclose(grad, fd, rtol=1e-4, atol=1e-4)
+
+    def test_frozen_scipy_parity(self):
+        rng = np.random.default_rng(42)
+        points = rng.random((50, 3))
+        values = rng.random(50)
+        queries = points + 0.03 * rng.standard_normal(points.shape)
+
+        interp_jax = LinearNDInterpolator(points, values, frozen_points=True)
+        interp_scipy = scipy.interpolate.LinearNDInterpolator(points, values)
+
+        assert_allclose(interp_jax(queries), interp_scipy(queries), rtol=1e-10)
+
+    def test_frozen_matches_deformable(self):
+        rng = np.random.default_rng(7)
+        points = rng.random((30, 2))
+        values = rng.random(30)
+        queries = points + 0.05 * rng.standard_normal(points.shape)
+
+        interp_def = LinearNDInterpolator(points, values)
+        interp_frz = LinearNDInterpolator(points, values, frozen_points=True)
+
+        assert_allclose(interp_frz(queries), interp_def(queries), rtol=1e-10)
+
+    def test_frozen_ad_query_and_values(self):
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = LinearNDInterpolator(points, values, frozen_points=True)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(q):
+            return interp(q[None, :])[0]
+
+        grad_xi = jax.grad(scalar_out)(query)
+        assert not np.allclose(grad_xi, 0.0)
+
+        def scalar_out_vals(vals):
+            mod = eqx.tree_at(lambda t: t.values, interp, vals)
+            return mod(query[None, :])[0]
+
+        grad_vals = jax.grad(scalar_out_vals)(values)
+        assert not np.allclose(grad_vals, 0.0)
+
+    def test_frozen_no_ad_points(self):
+        points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64
+        )
+        values = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        interp = LinearNDInterpolator(points, values, frozen_points=True)
+        query = np.array([0.2, 0.3], dtype=np.float64)
+
+        def scalar_out(pts):
+            mod = eqx.tree_at(lambda t: t.points, interp, pts)
+            return mod(query[None, :])[0]
+
+        grad = jax.grad(scalar_out)(points)
+        assert_allclose(grad, 0.0, atol=1e-14)
+
+    def test_frozen_jit_smoke(self):
+        x = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        y = np.array([0.0, 1.0, 2.0, 3.0])
+        interp = LinearNDInterpolator(x, y, frozen_points=True)
+        query = np.array([[0.2, 0.3], [0.8, 0.7]])
+
+        jitted = eqx.filter_jit(interp)
+        assert_allclose(jitted(query), interp(query), rtol=1e-12)

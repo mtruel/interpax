@@ -27,6 +27,7 @@ except where noted in the documentation.
     :template: class.rst
 
     interpax.NearestNDInterpolator
+    interpax.LinearNDInterpolator
     interpax.Akima1DInterpolator
     interpax.CubicHermiteSpline
     interpax.CubicSpline
